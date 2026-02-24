@@ -2,6 +2,7 @@ import sqlite3 as sq
 
 import ccxt
 import time
+import os
 
 from tabulate import tabulate
 from functools import wraps
@@ -38,7 +39,7 @@ def show_portfolio(c):
         return
 
     for x in all:
-        tick = x[0]
+        tick = x['TICKER']
         try:
             n = get_price(tick)
             price = f"{float(n['last']):.2f}"
@@ -49,9 +50,9 @@ def show_portfolio(c):
             c.execute(f"SELECT * FROM pf where TICKER = '{tick}'")
             sel = c.fetchall()
             for ha in sel:
-                quan = ha[1]
-                buypr = ha[2]
-                curpr = ha[3]
+                quan = ha['QUANTITY']
+                buypr = ha['BUY_PRICE']
+                curpr = ha['CURRENT_PRICE']
                 bt = quan * buypr
                 ct = quan * curpr
                 if bt > ct:
@@ -73,7 +74,7 @@ def show_portfolio(c):
     td = []
     for xy in nall:
         td.append(
-            [xy[0], xy[1], f"${xy[2]}", f"${xy[3]:.2f}", f"${xy[4]}", xy[5]]
+            [xy['TICKER'], xy['QUANTITY'], f"${xy['BUY_PRICE']}", f"${xy['CURRENT_PRICE']:.2f}", f"${xy['TOTAL_AMOUNT']}", xy['STATUS']]
         )
 
     table_output = tabulate(td, head, tablefmt="grid", stralign="center", numalign="center")
@@ -82,6 +83,11 @@ def show_portfolio(c):
 @sqldb
 def portfolio(c):
     while True:
+        try:
+            os.remove("portfolio.db-journal")
+        except:
+            pass
+
         print(
             "\nWhat you want to do? \n1. Coins add\n2. Coin remove\n3. View particular coin\n4. View all coins\n5. Clear all data\n6. Exit\n7. Live data"
         )
@@ -108,10 +114,19 @@ def portfolio(c):
         elif inpu == "7" or inpu == "7.":
             lines = len(show_portfolio().split("\n"))
             while True:
-                call = show_portfolio()
-                print(call)
-                time.sleep(2)
-                print(f"\033[{lines}A", end="")
+                try:
+                    call = show_portfolio()
+                    print(call)
+                    time.sleep(2)
+                    print(f"\033[{lines}A", end="")
+                except KeyboardInterrupt as e:
+                    try:
+                        os.remove("portfolio.db-journal")
+                    except:
+                        print()
+                        break
+                    print()
+                    break
 
         elif inpu == "1" or inpu == "1.":
             t = input("ENTER COIN TICKER: ").upper()
@@ -153,9 +168,9 @@ def portfolio(c):
                 c.execute(f"SELECT * FROM pf where TICKER = '{i}'")
                 sel = c.fetchall()
                 for ha in sel:
-                    quan = ha[1]
-                    buypr = ha[2]
-                    curpr = ha[3]
+                    quan = ha['QUANTITY']
+                    buypr = ha['BUY_PRICE']
+                    curpr = ha['CURRENT_PRICE']
                     bt = quan * buypr
                     ct = quan * curpr
                     if bt > ct:
@@ -174,7 +189,7 @@ def portfolio(c):
                 td = []
                 for xy in fet:
                     td.append(
-                        [xy[0], xy[1], f"${xy[2]}", f"${xy[3]:.2f}", f"${xy[4]}", xy[5]]
+                        [xy['TICKER'], xy['QUANTITY'], f"${xy['BUY_PRICE']}", f"${xy['CURRENT_PRICE']:.2f}", f"${xy['TOTAL_AMOUNT']}", xy['STATUS']]
                     )
 
                 print(
