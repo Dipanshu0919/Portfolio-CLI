@@ -2,12 +2,15 @@ import sqlite3 as sq
 
 import ccxt
 import time
+import threading
 import datetime
 
 from tabulate import tabulate
 from functools import wraps
 
 exchange = ccxt.bitget()
+
+thread_lock = threading.Lock()
 
 def sqldb(function):
     @wraps(function)
@@ -32,44 +35,45 @@ def get_price(coin, ticker="USDT"):
     price = exchange.fetch_ticker(f"{coin}/{ticker}")
     return price
 
+@sqldb
+def update_price(c, ticker, quantity, buy_price, current_price):
+    pass
+    buy_total_amount = buy_price * quantity
+    cp = get_price(ticker)
+    current_price = float(cp['last'])
+    current_total_amount = current_price * quantity
+
+    if buy_total_amount > current_total_amount:
+        status = f"LOSS: ${(buy_total_amount - current_total_amount):.8f}"
+    elif current_total_amount > buy_total_amount:
+        status = f"PROFIT: ${(current_total_amount - buy_total_amount):.8f}"
+    else:
+        status = "NO PROFIT/LOSS"
+
+    with thread_lock:
+        c.execute(
+            "UPDATE pf SET STATUS=?, TOTAL_AMOUNT=?, CURRENT_PRICE=? WHERE TICKER=? AND QUANTITY=? AND BUY_PRICE=?",
+            (status, round(current_total_amount, 18), current_price, ticker, quantity, buy_price)
+        )
+
+
 
 def show_portfolio(c):
     c.execute("SELECT * FROM pf")
     all = c.fetchall()
     if not all:
-        print("NO DATA FOUND!")
-        return None
+        return "No DATA FOUND!"
+
+    threads = []
 
     for x in all:
-        tick = x['TICKER']
-        try:
-            n = get_price(tick)
-            price = float(n['last'])
-            c.execute(
-                "UPDATE pf SET CURRENT_PRICE = ? WHERE TICKER = ?",
-                (price, tick),
-            )
-            c.execute("SELECT * FROM pf WHERE TICKER = ?", (tick,))
-            sel = c.fetchall()
-            for ha in sel:
-                quan  = float(ha['QUANTITY'])
-                buypr = float(ha['BUY_PRICE'])
-                curpr = float(ha['CURRENT_PRICE'])
-                bt = quan * buypr
-                ct = quan * curpr
-                if bt > ct:
-                    status = f"LOSS: ${(bt - ct):.8f}"
-                elif ct > bt:
-                    status = f"PROFIT: ${(ct - bt):.8f}"
-                else:
-                    status = "NO PROFIT/LOSS"
-                c.execute(
-                    "UPDATE pf SET STATUS = ?, TOTAL_AMOUNT = ? WHERE BUY_PRICE = ? AND TICKER = ?",
-                    (status, round(ct, 18), buypr, tick)
-                )
-        except Exception as e:
-            print(f"Error: {tick}: {e}")
-            continue
+        threads.append(threading.Thread(target=update_price, args=(x["TICKER"], x["QUANTITY"], x["BUY_PRICE"], x["CURRENT_PRICE"])))
+
+    for y in threads:
+        y.start()
+
+    for z in threads:
+        z.join()
 
     c.execute("SELECT * FROM pf")
     nall = c.fetchall()
