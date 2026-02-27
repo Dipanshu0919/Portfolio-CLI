@@ -3,6 +3,7 @@ import sqlite3 as sq
 import ccxt
 import time
 import os
+import sys
 import threading
 import datetime
 
@@ -102,14 +103,13 @@ def show_portfolio(c, coin_name=None):
 
 @sqldb
 def main(c):
-    while True:
         print(
             "\nWhat you want to do? \n1. Coins add\n2. Coin remove\n3. View particular coin\n4. View all coins\n5. Clear all data\n6. Exit\n7. Live data"
         )
         inpu = input("Select 1/2/3/4/5/6: ")
 
         if inpu in ("6", "6."):
-            break
+            sys.exit(1)
 
         elif inpu in ("5", "5."):
             inp2 = input("ARE YOU SURE YOU WANT TO REMOVE ALL DATA? \n1. Yes\n2. No: ")
@@ -138,7 +138,7 @@ def main(c):
                         # print(f"\033[{lines+3}A", end="")
                     except KeyboardInterrupt:
                         print()
-                        break
+                        return
 
         elif inpu in ("1", "1."):
             t = input("ENTER COIN TICKER: ").upper()
@@ -152,6 +152,7 @@ def main(c):
                 (t, q, p, tp, cp, tp),
             )
             print("COIN ADDED SUCCESFULY!")
+            return
 
         elif inpu in ("2", "2."):
             d = input("ENTER TICKER TO REMOVE FROM LIST: ").upper()
@@ -177,4 +178,5 @@ def main(c):
 
 
 if __name__ == "__main__":
-    main()
+    while True:
+        main()
