@@ -43,29 +43,27 @@ def get_price(coin, ticker="USDT"):
     global price_dict
     coin = coin.upper()
     ticker = ticker.upper()
-    with thread_lock:
-        if price_dict.get(coin):
-            price = price_dict.get(coin)
-        else:
-            price = exchange.fetch_ticker(f"{coin}/{ticker}")
-            print(f"FETCHING {coin}")
-            price_dict[coin] = price
+    # with thread_lock:
+    if price_dict.get(coin):
+        price = price_dict.get(coin)
+    else:
+        price = float(exchange.fetch_ticker(f"{coin}/{ticker}")['last'])
+        price_dict[coin] = price
     return price
 
 @sqldb
 def update_price(c, coin, quantity, buy_price, current_price):
     pass
     buy_total_amount = buy_price * quantity
-    cp = get_price(coin)
-    current_price = float(cp['last'])
+    current_price = get_price(coin)
     current_total_amount = current_price * quantity
 
     if buy_total_amount > current_total_amount:
-        status = f"LOSS: ${(buy_total_amount - current_total_amount):.8f}"
+        status = f"-{(buy_total_amount - current_total_amount):.8f}"
     elif current_total_amount > buy_total_amount:
-        status = f"PROFIT: ${(current_total_amount - buy_total_amount):.8f}"
+        status = f"+{(current_total_amount - buy_total_amount):.8f}"
     else:
-        status = "NO PROFIT/LOSS"
+        status = "0"
 
     with thread_lock:
         c.execute(
@@ -104,7 +102,7 @@ def show_portfolio(c, coin_name=None):
         c.execute("SELECT * FROM pf")
 
     nall = c.fetchall()
-    head = ["COIN", "QTY", "BUY AT", "BUY TOTAL", "CURRENT AT", "TOTAL", "STATUS"]
+    head = ["COIN", "QTY", "BUY AT", "BUY TOTAL", "CURRENT AT", "TOTAL", "P & L"]
     td = []
     for xy in nall:
         td.append([
@@ -117,7 +115,8 @@ def show_portfolio(c, coin_name=None):
             xy['STATUS']
         ])
 
-    return tabulate(td, head, tablefmt="grid", stralign="center", numalign="center")
+    sum = c.execute("SELECT SUM(STATUS) FROM pf").fetchone()
+    return (tabulate(td, head, tablefmt="grid", stralign="center", numalign="center"), sum)
 
 @sqldb
 def main(c):
@@ -138,21 +137,22 @@ def main(c):
                 print("REMOVED ALL DATA!")
 
         elif inpu in ("4", "4."):
-            result = show_portfolio(c)
+            result, _ = show_portfolio(c)
             print("\nHERE IS YOUR PORTFOLIO: \n")
             print(result)
 
         elif inpu in ("7", "7."):
             result = show_portfolio(c)
             if result:
-                lines = len(result.split("\n"))
+                # lines = len(result.split("\n"))
                 while True:
                     try:
-                        result = show_portfolio(c)
+                        result, sum = show_portfolio(c)
                         os.system("clear")
                         print(f"\nLAST UPDATED: {datetime.datetime.now()}\n")
                         print(result)
-                        time.sleep(2)
+                        print(f"\n\nTOTAL PROFIT/LOSS: {sum[0]}")
+                        time.sleep(5)
                         # print(f"\033[{lines+3}A", end="")
                     except KeyboardInterrupt:
                         print()
@@ -163,8 +163,7 @@ def main(c):
             q = float(input("ENTER TOTAL QUANTITY: "))
             p = float(input("ENTER BUY PRICE: "))
             tp = round(p * q, 18)
-            tick = get_price(t)
-            cp = float(tick['last'])
+            cp = get_price(t)
             c.execute(
                 "INSERT INTO pf(TICKER, QUANTITY, BUY_PRICE, BUY_TOTAL, CURRENT_PRICE, TOTAL_AMOUNT) VALUES (?, ?, ?, ?, ?, ?)",
                 (t, q, p, tp, cp, tp),
@@ -188,7 +187,7 @@ def main(c):
 
         elif inpu in ("3", "3."):
             i = input("ENTER TICKER TO FIND ALL DATA: ").upper()
-            call = show_portfolio(c, coin_name=i)
+            call, _ = show_portfolio(c, coin_name=i)
             print(call)
 
         elif inpu == "drop.table":
