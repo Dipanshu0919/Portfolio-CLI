@@ -14,6 +14,8 @@ exchange = ccxt.bitget()
 
 thread_lock = threading.Lock()
 
+price_dict = {}
+
 def sqldb(function):
     @wraps(function)
     def wrapper(*args, **kwargs):
@@ -31,10 +33,23 @@ def sqldb(function):
         return call_function
     return wrapper
 
+
+def clear_price_dict():
+    global price_dict
+    price_dict.clear()
+
+
 def get_price(coin, ticker="USDT"):
+    global price_dict
     coin = coin.upper()
     ticker = ticker.upper()
-    price = exchange.fetch_ticker(f"{coin}/{ticker}")
+    with thread_lock:
+        if price_dict.get(coin):
+            price = price_dict.get(coin)
+        else:
+            price = exchange.fetch_ticker(f"{coin}/{ticker}")
+            print(f"FETCHING {coin}")
+            price_dict[coin] = price
     return price
 
 @sqldb
@@ -60,6 +75,7 @@ def update_price(c, coin, quantity, buy_price, current_price):
 
 
 def show_portfolio(c, coin_name=None):
+    global price_dict
     if coin_name:
         c.execute("SELECT * FROM pf WHERE TICKER=?", (coin_name,))
     else:
@@ -79,6 +95,8 @@ def show_portfolio(c, coin_name=None):
 
     for z in threads:
         z.join()
+
+    clear_price_dict()
 
     if coin_name:
         c.execute("SELECT * FROM pf WHERE TICKER=?", (coin_name,))
@@ -179,4 +197,8 @@ def main(c):
 
 if __name__ == "__main__":
     while True:
-        main()
+        try:
+            main()
+        except KeyboardInterrupt:
+            print("\nEXITING....")
+            break
