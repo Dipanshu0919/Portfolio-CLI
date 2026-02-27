@@ -2,6 +2,7 @@ import sqlite3 as sq
 
 import ccxt
 import time
+import os
 import threading
 import datetime
 
@@ -36,10 +37,10 @@ def get_price(coin, ticker="USDT"):
     return price
 
 @sqldb
-def update_price(c, ticker, quantity, buy_price, current_price):
+def update_price(c, coin, quantity, buy_price, current_price):
     pass
     buy_total_amount = buy_price * quantity
-    cp = get_price(ticker)
+    cp = get_price(coin)
     current_price = float(cp['last'])
     current_total_amount = current_price * quantity
 
@@ -53,13 +54,16 @@ def update_price(c, ticker, quantity, buy_price, current_price):
     with thread_lock:
         c.execute(
             "UPDATE pf SET STATUS=?, TOTAL_AMOUNT=?, CURRENT_PRICE=? WHERE TICKER=? AND QUANTITY=? AND BUY_PRICE=?",
-            (status, round(current_total_amount, 18), current_price, ticker, quantity, buy_price)
+            (status, round(current_total_amount, 18), current_price, coin, quantity, buy_price)
         )
 
 
+def show_portfolio(c, coin_name=None):
+    if coin_name:
+        c.execute("SELECT * FROM pf WHERE TICKER=?", (coin_name,))
+    else:
+        c.execute("SELECT * FROM pf")
 
-def show_portfolio(c):
-    c.execute("SELECT * FROM pf")
     all = c.fetchall()
     if not all:
         return "No DATA FOUND!"
@@ -75,9 +79,13 @@ def show_portfolio(c):
     for z in threads:
         z.join()
 
-    c.execute("SELECT * FROM pf")
+    if coin_name:
+        c.execute("SELECT * FROM pf WHERE TICKER=?", (coin_name,))
+    else:
+        c.execute("SELECT * FROM pf")
+
     nall = c.fetchall()
-    head = ["TICKER", "QTY", "BUY AT", "BUY TOTAL", "CURRENT AT", "TOTAL", "STATUS"]
+    head = ["COIN", "QTY", "BUY AT", "BUY TOTAL", "CURRENT AT", "TOTAL", "STATUS"]
     td = []
     for xy in nall:
         td.append([
@@ -93,7 +101,7 @@ def show_portfolio(c):
     return tabulate(td, head, tablefmt="grid", stralign="center", numalign="center")
 
 @sqldb
-def portfolio(c):
+def main(c):
     while True:
         print(
             "\nWhat you want to do? \n1. Coins add\n2. Coin remove\n3. View particular coin\n4. View all coins\n5. Clear all data\n6. Exit\n7. Live data"
@@ -123,10 +131,11 @@ def portfolio(c):
                 while True:
                     try:
                         result = show_portfolio(c)
+                        os.system("clear")
                         print(f"\nLAST UPDATED: {datetime.datetime.now()}\n")
                         print(result)
                         time.sleep(2)
-                        print(f"\033[{lines+3}A", end="")
+                        # print(f"\033[{lines+3}A", end="")
                     except KeyboardInterrupt:
                         print()
                         break
@@ -160,52 +169,12 @@ def portfolio(c):
 
         elif inpu in ("3", "3."):
             i = input("ENTER TICKER TO FIND ALL DATA: ").upper()
-            c.execute("SELECT * FROM pf WHERE TICKER = ?", (i,))
-            f = c.fetchone()
-            if f:
-                tick = get_price(i)
-                price = float(tick['last'])
-                c.execute("UPDATE pf SET CURRENT_PRICE = ? WHERE TICKER = ?", (price, i))
-                c.execute("SELECT * FROM pf WHERE TICKER = ?", (i,))
-                sel = c.fetchall()
-                for ha in sel:
-                    quan  = float(ha['QUANTITY'])
-                    buypr = float(ha['BUY_PRICE'])
-                    curpr = float(ha['CURRENT_PRICE'])
-                    bt = quan * buypr
-                    ct = quan * curpr
-                    if bt > ct:
-                        status = f"LOSS: ${(bt - ct):.8f}"
-                    elif ct > bt:
-                        status = f"PROFIT: ${(ct - bt):.8f}"
-                    else:
-                        status = "NO PROFIT/LOSS"
-                    c.execute(
-                        "UPDATE pf SET STATUS = ?, TOTAL_AMOUNT = ? WHERE BUY_PRICE = ? AND TICKER = ?",
-                        (status, round(ct, 18), buypr, i)
-                    )
-
-                c.execute("SELECT * FROM pf WHERE TICKER = ?", (i,))
-                fet = c.fetchall()
-                head = ["TICKER", "QUANTITY", "BUY AT", "BUY TOTAL", "CURRENT AT", "TOTAL", "STATUS"]
-                td = []
-                for xy in fet:
-                    td.append([
-                        xy['TICKER'],
-                        xy['QUANTITY'],
-                        f"${float(xy['BUY_PRICE']):.8f}",
-                        f"${float(xy['BUY_TOTAL']):.8f}",
-                        f"${float(xy['CURRENT_PRICE']):.8f}",
-                        f"${float(xy['TOTAL_AMOUNT']):.8f}",
-                        xy['STATUS']
-                    ])
-                print(tabulate(td, head, tablefmt="grid", stralign="center", numalign="center"))
-            else:
-                print("TICKER NOT FOUND IN DATABASE!")
+            call = show_portfolio(c, coin_name=i)
+            print(call)
 
         elif inpu == "drop.table":
             c.execute("DROP TABLE pf")
 
 
 if __name__ == "__main__":
-    portfolio()
+    main()
