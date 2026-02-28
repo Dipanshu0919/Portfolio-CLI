@@ -87,12 +87,8 @@ def update_price(c, coin, quantity, buy_price, current_price):
     current_price = get_price(coin)
     current_total_amount = current_price * quantity
 
-    if buy_total_amount > current_total_amount:
-        status = f"-{(buy_total_amount - current_total_amount):.8f}"
-    elif current_total_amount > buy_total_amount:
-        status = f"+{(current_total_amount - buy_total_amount):.8f}"
-    else:
-        status = "0"
+    diff = current_total_amount - buy_total_amount
+    status = f"{diff:+.4f}"
 
     with thread_lock:
         c.execute(
@@ -133,6 +129,22 @@ def show_portfolio(c, coin_name=None):
 
     nall = c.fetchall()
     head = ["COIN", "QTY", "BUY AT", "BUY TOTAL", "CURRENT AT", "TOTAL", "P & L"]
+    percentage = []
+
+    for x in nall:
+        buytotal = x["BUY_TOTAL"]
+        currenttotal = x["TOTAL_AMOUNT"]
+        calc = (buytotal/currenttotal) * 100
+        if buytotal == 0:
+            calc = "N/A"
+        else:
+            pe = ((currenttotal - buytotal) / buytotal) * 100
+            calc = f"{pe:+.2f}%"
+
+        percentage.append(calc)
+
+    zipped = zip(nall, percentage)
+
     td = [
         [
             xy['TICKER'],
@@ -141,10 +153,12 @@ def show_portfolio(c, coin_name=None):
             f"${float(xy['BUY_TOTAL']):.4f}",
             f"${float(xy['CURRENT_PRICE']):.4f}",
             f"${float(xy['TOTAL_AMOUNT']):.4f}",
-            xy['STATUS']
+            f"{xy['STATUS']} ({per})",
         ]
-        for xy in nall
+        for xy, per in zipped
     ]
+
+    del percentage, nall, zipped
 
     total = c.execute("SELECT SUM(STATUS) FROM pf").fetchone()
     return tabulate(td, head, tablefmt="grid", stralign="center", numalign="center"), total
