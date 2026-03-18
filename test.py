@@ -1,16 +1,20 @@
-api_token = "mlsn.9619c1f868b96226f249f5505ec56f6dcf3073687547c7a5ed320ace257cf6e9"
-domain = "sahyogsutra.run.place"
+import time
+import ccxt
+import ccxt.async_support as ccxt_async
 
-from mailersend import MailerSendClient, EmailBuilder
+print("Testing connection times for sync and async exchanges...")
 
-ms = MailerSendClient(api_key=api_token)
+print("Connecting to sync exchange...")
 
-email = (EmailBuilder()
-    .from_email(f"donotreply@{domain}", "dipanshu")
-         .to_many([{"email": "dipanshu0919@gmail.com", "name": "Sahyogi"}])
-         .subject("Hello from SahyogSutra!")
-         .html("<b>This is a test mail!</b>")
-         .build())
+now = time.time()
 
-response = ms.emails.send(email)
-print(response)
+exchange = ccxt.bitget()
+
+print(f"connection time for sync exhange: {time.time() - now} seconds")
+
+print("Connecting to async exchange...")
+
+now = time.time()
+
+async_exchange = ccxt_async.bitget()
+print(f"connection time for async exhange: {time.time() - now} seconds")

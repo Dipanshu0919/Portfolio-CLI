@@ -1,11 +1,9 @@
 from __future__ import annotations
-
 import asyncio
 import datetime
 import sqlite3 as sq
 import threading
 from functools import wraps
-
 import ccxt
 import ccxt.async_support as ccxt_async
 from rich.text import Text
@@ -14,17 +12,14 @@ from textual import events
 from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, HorizontalScroll, Vertical
 from textual.widgets import Button, DataTable, Footer, Header, Input, Static
-
 exchange = ccxt.bitget()
 thread_lock = threading.Lock()
 price_dict: dict[str, float] = {}
-
 async_exchange = ccxt_async.bitget()
 _loop = asyncio.new_event_loop()
 _loop_thread = threading.Thread(target=_loop.run_forever, daemon=True)
 _loop_thread.start()
-
-PORTFOLIO_HEADERS = ("COIN", "QTY", "BUY AT", "BUY TOTAL", "CURRENT AT", "TOTAL", "P & L")
+PORTFOLIO_HEADERS = ("COIN", "EXCHANGE", "QTY", "BUY AT", "BUY TOTAL", "CURRENT AT", "TOTAL", "P & L")
 PAGE_NAMES = ("add", "remove", "view-one", "view-all", "clear", "live")
 NAV_ITEMS = (
     ("add", "Coins add"),
@@ -35,8 +30,6 @@ NAV_ITEMS = (
     ("exit", "Exit"),
     ("live", "Live data"),
 )
-
-
 def sqldb(function):
     @wraps(function)
     def wrapper(*args, **kwargs):
@@ -50,16 +43,18 @@ def sqldb(function):
                 "QUANTITY decimal(38,18), "
                 "BUY_PRICE decimal(38,18), "
                 "BUY_TOTAL decimal(38,18), "
+                "EXCHANGE varchar(50) DEFAULT 'bitget', "
                 "CURRENT_PRICE decimal(38,18), "
                 "TOTAL_AMOUNT decimal(38,18), "
                 "STATUS varchar(50))"
             )
+            # Removed ALTER TABLE migration code — EXCHANGE column is always
+            # present in the CREATE TABLE statement above.
             call_function = function(c, *args, **kwargs)
         finally:
             db.commit()
             db.close()
         return call_function
-
     return wrapper
 
 
@@ -99,22 +94,37 @@ def get_price(coin, ticker="USDT"):
     return price
 
 
+def _normalize_exchange_value(exchange_name: str | None) -> str:
+    normalized = (exchange_name or "bitget").strip()
+    return normalized or "bitget"
+
+
+def _record_to_table_row(record):
+    return (
+        record["ticker"],
+        record["exchange"],
+        record["quantity_text"],
+        _format_currency(record["buy_price"]),
+        _format_currency(record["buy_total"]),
+        _format_currency(record["current_price"]),
+        _format_currency(record["total_amount"]),
+        record["pnl_text"],
+    )
+
+
 @sqldb
-def update_price(c, coin, quantity, buy_price, current_price):
+def update_price(c, row_id, coin, quantity, buy_price):
     buy_total_amount = buy_price * quantity
     current_price = get_price(coin)
     if current_price is None:
         return
-
     current_total_amount = current_price * quantity
     diff = current_total_amount - buy_total_amount
     status = f"{diff:+.4f}"
-
     with thread_lock:
         c.execute(
-            "UPDATE pf SET STATUS=?, TOTAL_AMOUNT=?, CURRENT_PRICE=? "
-            "WHERE TICKER=? AND QUANTITY=? AND BUY_PRICE=?",
-            (status, round(current_total_amount, 18), current_price, coin, quantity, buy_price),
+            "UPDATE pf SET STATUS=?, TOTAL_AMOUNT=?, CURRENT_PRICE=? WHERE rowid=?",
+            (status, round(current_total_amount, 18), current_price, row_id),
         )
 
 
@@ -135,74 +145,68 @@ def _style_pnl_cell(value: str):
 
 
 def _build_portfolio_snapshot(c, coin_name=None):
+    query = "SELECT rowid AS ROW_ID, * FROM pf"
     if coin_name:
-        c.execute("SELECT * FROM pf WHERE TICKER=?", (coin_name,))
+        query += " WHERE TICKER=?"
+        c.execute(query, (coin_name,))
     else:
-        c.execute("SELECT * FROM pf")
-
+        c.execute(query)
     all_rows = c.fetchall()
     if not all_rows:
         return [], 0.0
-
     coins_list = list({row["TICKER"] for row in all_rows})
     fetched_prices = run_async_fetch(coins_list)
     price_dict.update(fetched_prices)
-
     threads = [
         threading.Thread(
             target=update_price,
-            args=(row["TICKER"], row["QUANTITY"], row["BUY_PRICE"], row["CURRENT_PRICE"]),
+            args=(row["ROW_ID"], row["TICKER"], row["QUANTITY"], row["BUY_PRICE"]),
         )
         for row in all_rows
     ]
-
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join()
-
     clear_price_dict()
-
     if coin_name:
-        c.execute("SELECT * FROM pf WHERE TICKER=?", (coin_name,))
+        c.execute(query, (coin_name,))
     else:
-        c.execute("SELECT * FROM pf")
-
+        c.execute(query)
     refreshed_rows = c.fetchall()
     rendered_rows = []
     total_profit_loss = 0.0
-
     for row in refreshed_rows:
         buy_total = float(row["BUY_TOTAL"] or 0)
         current_total = float(row["TOTAL_AMOUNT"] or 0)
         status_value = float(row["STATUS"] or 0)
         total_profit_loss += status_value
-
         if buy_total == 0:
             percentage = "N/A"
         else:
             percentage = f"{((current_total - buy_total) / buy_total) * 100:+.2f}%"
-
         rendered_rows.append(
-            (
-                row["TICKER"],
-                str(row["QUANTITY"]),
-                _format_currency(row["BUY_PRICE"]),
-                _format_currency(row["BUY_TOTAL"]),
-                _format_currency(row["CURRENT_PRICE"]),
-                _format_currency(row["TOTAL_AMOUNT"]),
-                f"{row['STATUS'] or '+0.0000'} ({percentage})",
-            )
+            {
+                "row_id": row["ROW_ID"],
+                "ticker": row["TICKER"],
+                "exchange": _normalize_exchange_value(row["EXCHANGE"]),
+                "quantity_text": str(row["QUANTITY"]),
+                "buy_price": row["BUY_PRICE"],
+                "buy_total": row["BUY_TOTAL"],
+                "current_price": row["CURRENT_PRICE"],
+                "total_amount": row["TOTAL_AMOUNT"],
+                "pnl_text": f"{row['STATUS'] or '+0.0000'} ({percentage})",
+            }
         )
-
     return rendered_rows, total_profit_loss
 
 
 @sqldb
 def show_portfolio(c, coin_name=None):
-    rows, total = _build_portfolio_snapshot(c, coin_name)
-    if not rows:
+    records, total = _build_portfolio_snapshot(c, coin_name)
+    if not records:
         return "No DATA FOUND!", (0.0,)
+    rows = [_record_to_table_row(record) for record in records]
     return tabulate(rows, PORTFOLIO_HEADERS, tablefmt="grid", stralign="center", numalign="center"), (total,)
 
 
@@ -212,19 +216,53 @@ def get_portfolio_snapshot(c, coin_name=None):
 
 
 @sqldb
-def add_coin(c, ticker, quantity, buy_price):
+def add_coin(c, ticker, quantity, buy_price, exchange_name):
     ticker = ticker.upper()
+    exchange_name = _normalize_exchange_value(exchange_name)
     total_purchase = round(buy_price * quantity, 18)
     current_price = get_price(ticker)
     if current_price is None:
         raise ValueError(f"Unable to fetch live price for {ticker}.")
-
     c.execute(
-        "INSERT INTO pf(TICKER, QUANTITY, BUY_PRICE, BUY_TOTAL, CURRENT_PRICE, TOTAL_AMOUNT, STATUS) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (ticker, quantity, buy_price, total_purchase, current_price, total_purchase, "0.0000"),
+        "INSERT INTO pf(TICKER, QUANTITY, BUY_PRICE, BUY_TOTAL, EXCHANGE, CURRENT_PRICE, TOTAL_AMOUNT, STATUS) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (ticker, quantity, buy_price, total_purchase, exchange_name, current_price, total_purchase, "0.0000"),
     )
     return ticker, current_price
+
+
+@sqldb
+def get_portfolio_row(c, row_id):
+    row = c.execute("SELECT rowid AS ROW_ID, * FROM pf WHERE rowid = ?", (row_id,)).fetchone()
+    if not row:
+        return None
+    return {
+        "row_id": row["ROW_ID"],
+        "ticker": row["TICKER"],
+        "exchange": _normalize_exchange_value(row["EXCHANGE"]),
+        "quantity_text": str(row["QUANTITY"]),
+        "buy_price": row["BUY_PRICE"],
+    }
+
+
+@sqldb
+def update_portfolio_row(c, row_id, quantity, exchange_name):
+    row = c.execute("SELECT rowid AS ROW_ID, * FROM pf WHERE rowid = ?", (row_id,)).fetchone()
+    if not row:
+        raise ValueError("Selected row no longer exists.")
+    exchange_name = _normalize_exchange_value(exchange_name)
+    buy_price = float(row["BUY_PRICE"] or 0)
+    buy_total = round(buy_price * quantity, 18)
+    current_price = get_price(row["TICKER"])
+    if current_price is None:
+        raise ValueError(f"Unable to fetch live price for {row['TICKER']}.")
+    total_amount = round(current_price * quantity, 18)
+    status = f"{(total_amount - buy_total):+.4f}"
+    c.execute(
+        "UPDATE pf SET QUANTITY=?, EXCHANGE=?, BUY_TOTAL=?, CURRENT_PRICE=?, TOTAL_AMOUNT=?, STATUS=? "
+        "WHERE rowid=?",
+        (quantity, exchange_name, buy_total, current_price, total_amount, status, row_id),
+    )
 
 
 @sqldb
@@ -254,7 +292,6 @@ def _parse_positive_number(raw_value, field_name):
         parsed = float(raw_value)
     except ValueError as exc:
         raise ValueError(f"{field_name} must be a valid number.") from exc
-
     if parsed <= 0:
         raise ValueError(f"{field_name} must be greater than zero.")
     return parsed
@@ -262,32 +299,27 @@ def _parse_positive_number(raw_value, field_name):
 
 class PortfolioTextualApp(App):
     COMPACT_WIDTH = 100
-
     CSS = """
     Screen {
         layout: vertical;
         background: #08111f;
         color: #f8fafc;
     }
-
     Header {
         dock: top;
     }
-
     #nav-shell {
         dock: top;
         height: auto;
         background: #0f172a;
         border-bottom: solid #1d4ed8;
     }
-
     #nav-bar {
         height: auto;
         width: auto;
         padding: 1 2;
         background: #0f172a;
     }
-
     #nav-bar Button {
         margin-right: 1;
         min-width: 14;
@@ -295,33 +327,27 @@ class PortfolioTextualApp(App):
         color: #dbeafe;
         border: solid #274060;
     }
-
     #nav-bar Button.active {
         background: #1d4ed8;
         color: #ffffff;
         text-style: bold;
     }
-
     #page-stack {
         height: 1fr;
         padding: 1 2;
     }
-
     .page {
         height: 1fr;
     }
-
     .section-title {
         margin-bottom: 1;
         color: #f8fafc;
         text-style: bold;
     }
-
     .help-text {
         margin-bottom: 1;
         color: #94a3b8;
     }
-
     .summary {
         margin: 1 0;
         padding: 1 1;
@@ -329,37 +355,30 @@ class PortfolioTextualApp(App):
         color: #bfdbfe;
         border: round #334155;
     }
-
     .form-row {
         height: auto;
         margin-bottom: 1;
     }
-
     .field-label {
         width: 24;
         padding-top: 1;
         color: #93c5fd;
     }
-
     .field-input {
         width: 1fr;
     }
-
     .action-row {
         height: auto;
         margin-top: 1;
     }
-
     .action-row Button {
         margin-right: 1;
     }
-
     DataTable {
         height: 1fr;
         margin-top: 1;
         background: #020617;
     }
-
     #status-bar {
         dock: bottom;
         height: auto;
@@ -368,48 +387,60 @@ class PortfolioTextualApp(App):
         color: #e2e8f0;
         border-top: solid #1e293b;
     }
-
     Footer {
         dock: bottom;
     }
-
+    /* Edit row: two fields side-by-side */
+    #view-all-edit-row {
+        height: auto;
+        margin-bottom: 1;
+    }
+    #view-all-edit-row .field-label {
+        width: 16;
+    }
+    #view-all-edit-row .field-input {
+        width: 1fr;
+        margin-right: 2;
+    }
+    #view-all-edit-row .field-input:last-of-type {
+        margin-right: 0;
+    }
     Screen.compact #nav-bar {
         padding: 1;
     }
-
     Screen.compact #nav-bar Button {
         min-width: 10;
     }
-
     Screen.compact #page-stack {
         padding: 1;
     }
-
     Screen.compact .form-row {
         layout: vertical;
     }
-
     Screen.compact .field-label {
         width: 1fr;
         padding-top: 0;
         margin-bottom: 1;
     }
-
     Screen.compact .action-row {
         layout: vertical;
     }
-
     Screen.compact .action-row Button {
         width: 1fr;
         margin-right: 0;
         margin-bottom: 1;
     }
-
     Screen.compact .summary {
         padding: 1;
     }
+    Screen.compact #view-all-edit-row {
+        layout: vertical;
+    }
+    Screen.compact #view-all-edit-row .field-input {
+        margin-right: 0;
+        margin-bottom: 1;
+    }
     """
-
     BINDINGS = [
         ("1", "show_add", "Coins add"),
         ("2", "show_remove", "Coin remove"),
@@ -425,6 +456,7 @@ class PortfolioTextualApp(App):
         super().__init__()
         self.active_view = "add"
         self.live_refresh_in_progress = False
+        self.selected_view_all_row_id: int | None = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -433,15 +465,19 @@ class PortfolioTextualApp(App):
                 for page_name, label in NAV_ITEMS:
                     yield Button(label, id=f"nav-{page_name}")
         with Container(id="page-stack"):
+            # ── ADD ──────────────────────────────────────────────────────────
             with Vertical(id="page-add", classes="page"):
-                yield Static("Coins Add", classes="section-title")
                 yield Static(
-                    "Fill all fields, then submit to save a new holding to portfolio.db.",
-                    classes="help-text",
+                    "Coins Add  (Fill all fields, then submit to save a new holding to portfolio.db.)",
+                    classes="section-title",
                 )
                 with Horizontal(classes="form-row"):
                     yield Static("Coin ticker", classes="field-label")
                     yield Input(placeholder="BTC", id="add-ticker", classes="field-input")
+                with Horizontal(classes="form-row"):
+                    yield Static("Exchange", classes="field-label")
+                    # No default value — user types their exchange freely
+                    yield Input(placeholder="bitget", id="add-exchange", classes="field-input")
                 with Horizontal(classes="form-row"):
                     yield Static("Total quantity", classes="field-label")
                     yield Input(placeholder="0.50", id="add-quantity", classes="field-input")
@@ -452,11 +488,11 @@ class PortfolioTextualApp(App):
                     yield Button("Add coin", id="submit-add", variant="primary")
                     yield Button("Reset", id="reset-add")
 
+            # ── REMOVE ───────────────────────────────────────────────────────
             with Vertical(id="page-remove", classes="page"):
-                yield Static("Coin Remove", classes="section-title")
                 yield Static(
-                    "Enter the ticker and type YES to remove every row for that coin.",
-                    classes="help-text",
+                    "Coin Remove  (Enter the ticker and type YES to remove every row for that coin.)",
+                    classes="section-title",
                 )
                 with Horizontal(classes="form-row"):
                     yield Static("Coin ticker", classes="field-label")
@@ -468,11 +504,11 @@ class PortfolioTextualApp(App):
                     yield Button("Remove coin", id="submit-remove", variant="error")
                     yield Button("Reset", id="reset-remove")
 
+            # ── VIEW ONE ─────────────────────────────────────────────────────
             with Vertical(id="page-view-one", classes="page"):
-                yield Static("View Particular Coin", classes="section-title")
                 yield Static(
-                    "Enter a ticker to refresh and display only that coin's rows.",
-                    classes="help-text",
+                    "View Particular Coin  (Enter a ticker to refresh and display only that coin's rows.)",
+                    classes="section-title",
                 )
                 with Horizontal(classes="form-row"):
                     yield Static("Coin ticker", classes="field-label")
@@ -483,22 +519,47 @@ class PortfolioTextualApp(App):
                 yield Static("No coin loaded yet.", id="view-one-summary", classes="summary")
                 yield DataTable(id="view-one-table")
 
+            # ── VIEW ALL ─────────────────────────────────────────────────────
             with Vertical(id="page-view-all", classes="page"):
-                yield Static("View All Coins", classes="section-title")
                 yield Static(
-                    "Refresh the whole portfolio with the latest fetched prices.",
-                    classes="help-text",
+                    "View All Coins  (Refresh the whole portfolio with the latest fetched prices."
+                    " Press Enter on a ✎ row to edit Exchange and Qty.)",
+                    classes="section-title",
                 )
                 with Horizontal(classes="action-row"):
                     yield Button("Refresh portfolio", id="submit-view-all", variant="primary")
                 yield Static("No portfolio data loaded yet.", id="view-all-summary", classes="summary")
+                # ── inline editor ────────────────────────────────────────────
+                with Vertical(id="view-all-editor"):
+                    yield Static(
+                        "No row selected. Use the ✎ row in the table to load the editor.",
+                        id="view-all-editor-summary",
+                        classes="summary",
+                    )
+                    # Exchange + Quantity on a single row
+                    with Horizontal(id="view-all-edit-row"):
+                        yield Static("Exchange", classes="field-label")
+                        yield Input(
+                            placeholder="bitget",
+                            id="view-all-edit-exchange",
+                            classes="field-input",
+                        )
+                        yield Static("Buy quantity", classes="field-label")
+                        yield Input(
+                            placeholder="0.50",
+                            id="view-all-edit-quantity",
+                            classes="field-input",
+                        )
+                    with Horizontal(classes="action-row"):
+                        yield Button("Save row changes", id="submit-view-all-edit", variant="primary")
+                        yield Button("Cancel edit", id="reset-view-all-edit")
                 yield DataTable(id="view-all-table")
 
+            # ── CLEAR ────────────────────────────────────────────────────────
             with Vertical(id="page-clear", classes="page"):
-                yield Static("Clear All Data", classes="section-title")
                 yield Static(
-                    "Type CLEAR to remove every portfolio row from the database.",
-                    classes="help-text",
+                    "Clear All Data  (Type CLEAR to remove every portfolio row from the database.)",
+                    classes="section-title",
                 )
                 with Horizontal(classes="form-row"):
                     yield Static("Confirmation", classes="field-label")
@@ -507,23 +568,25 @@ class PortfolioTextualApp(App):
                     yield Button("Clear data", id="submit-clear", variant="error")
                     yield Button("Reset", id="reset-clear")
 
+            # ── LIVE ─────────────────────────────────────────────────────────
             with Vertical(id="page-live", classes="page"):
-                yield Static("Live Data", classes="section-title")
                 yield Static(
-                    "This view auto-refreshes every 5 seconds while it is open.",
-                    classes="help-text",
+                    "Live Data  (This view auto-refreshes every 5 seconds while it is open.)",
+                    classes="section-title",
                 )
                 with Horizontal(classes="action-row"):
                     yield Button("Refresh now", id="submit-live-now", variant="primary")
                 yield Static("Last updated: never", id="live-updated", classes="summary")
                 yield Static("No live portfolio data loaded yet.", id="live-summary", classes="summary")
                 yield DataTable(id="live-table")
+
         yield Static("Ready. Use the top navbar or keys 1-7.", id="status-bar")
         yield Footer()
 
     def on_mount(self) -> None:
         self._setup_tables()
         self._update_responsive_mode(self.size.width)
+        self._set_view_all_editor_visible(False)
         self.switch_view("add")
         self.set_interval(5, self._trigger_live_refresh)
 
@@ -532,7 +595,6 @@ class PortfolioTextualApp(App):
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
         button_id = event.button.id or ""
-
         if button_id.startswith("nav-"):
             page_name = button_id.removeprefix("nav-")
             if page_name == "exit":
@@ -540,7 +602,6 @@ class PortfolioTextualApp(App):
             else:
                 self.switch_view(page_name)
             return
-
         if button_id == "submit-add":
             await self.handle_add_coin()
         elif button_id == "reset-add":
@@ -555,12 +616,24 @@ class PortfolioTextualApp(App):
             self.reset_single_coin_view()
         elif button_id == "submit-view-all":
             await self.refresh_all_view()
+        elif button_id == "submit-view-all-edit":
+            await self.handle_save_view_all_edit()
+        elif button_id == "reset-view-all-edit":
+            self.reset_view_all_editor()
         elif button_id == "submit-clear":
             await self.handle_clear_all()
         elif button_id == "reset-clear":
             self.reset_clear_form()
         elif button_id == "submit-live-now":
             await self.refresh_live_view()
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        if event.data_table.id != "view-all-table":
+            return
+        row_key_value = event.row_key.value
+        if not row_key_value.startswith("row-"):
+            return
+        self.load_view_all_editor(int(row_key_value.removeprefix("row-")))
 
     def action_show_add(self) -> None:
         self.switch_view("add")
@@ -586,18 +659,14 @@ class PortfolioTextualApp(App):
     def switch_view(self, page_name: str) -> None:
         if page_name not in PAGE_NAMES:
             return
-
         self.active_view = page_name
-
         for current_page in PAGE_NAMES:
             page = self.query_one(f"#page-{current_page}", Vertical)
             page.display = current_page == page_name
-
         for nav_name, _ in NAV_ITEMS:
             if nav_name == "exit":
                 continue
             self.query_one(f"#nav-{nav_name}", Button).set_class(nav_name == page_name, "active")
-
         if page_name == "add":
             self.query_one("#add-ticker", Input).focus()
             self.set_status("Add a new holding by filling all visible fields.")
@@ -608,7 +677,8 @@ class PortfolioTextualApp(App):
             self.query_one("#view-one-ticker", Input).focus()
             self.set_status("Enter a ticker to view one coin.")
         elif page_name == "view-all":
-            self.set_status("Refreshing full portfolio view.")
+            self._set_view_all_editor_visible(False)
+            self.set_status("Refreshing full portfolio view. Select a ✎ row to edit Exchange and Qty.")
             asyncio.create_task(self.refresh_all_view())
         elif page_name == "clear":
             self.query_one("#clear-confirmation", Input).focus()
@@ -618,22 +688,59 @@ class PortfolioTextualApp(App):
             asyncio.create_task(self.refresh_live_view())
 
     def _setup_tables(self) -> None:
-        for table_id in ("#view-one-table", "#view-all-table", "#live-table"):
+        for table_id in ("#view-one-table", "#live-table"):
             table = self.query_one(table_id, DataTable)
             table.add_columns(*PORTFOLIO_HEADERS)
             table.cursor_type = "row"
+        view_all_table = self.query_one("#view-all-table", DataTable)
+        view_all_table.add_columns(
+            ("EDIT", "edit"),
+            ("COIN", "coin"),
+            ("EXCHANGE", "exchange"),
+            ("QTY", "quantity"),
+            ("BUY AT", "buy_price"),
+            ("BUY TOTAL", "buy_total"),
+            ("CURRENT AT", "current_price"),
+            ("TOTAL", "total_amount"),
+            ("P & L", "pnl"),
+        )
+        view_all_table.cursor_type = "row"
 
     def _update_responsive_mode(self, width: int) -> None:
         self.screen.set_class(width < self.COMPACT_WIDTH, "compact")
 
+    def _set_view_all_editor_visible(self, visible: bool) -> None:
+        self.query_one("#view-all-editor", Vertical).display = visible
+
     def _render_rows(self, table_id: str, rows) -> None:
         table = self.query_one(table_id, DataTable)
         table.clear(columns=False)
-        for row in rows:
-            styled_row = list(row)
-            if styled_row:
-                styled_row[-1] = _style_pnl_cell(str(styled_row[-1]))
-            table.add_row(*styled_row)
+        for record in rows:
+            if table_id == "#view-all-table":
+                table.add_row(
+                    Text("✎", style="bold yellow"),
+                    record["ticker"],
+                    Text(record["exchange"], style="bold cyan"),
+                    Text(record["quantity_text"], style="bold cyan"),
+                    _format_currency(record["buy_price"]),
+                    _format_currency(record["buy_total"]),
+                    _format_currency(record["current_price"]),
+                    _format_currency(record["total_amount"]),
+                    _style_pnl_cell(record["pnl_text"]),
+                    key=f"row-{record['row_id']}",
+                )
+                continue
+            table.add_row(
+                record["ticker"],
+                record["exchange"],
+                record["quantity_text"],
+                _format_currency(record["buy_price"]),
+                _format_currency(record["buy_total"]),
+                _format_currency(record["current_price"]),
+                _format_currency(record["total_amount"]),
+                _style_pnl_cell(record["pnl_text"]),
+                key=f"row-{record['row_id']}",
+            )
 
     def _trigger_live_refresh(self) -> None:
         if self.active_view != "live" or self.live_refresh_in_progress:
@@ -645,6 +752,7 @@ class PortfolioTextualApp(App):
 
     def reset_add_form(self) -> None:
         self.query_one("#add-ticker", Input).value = ""
+        self.query_one("#add-exchange", Input).value = ""
         self.query_one("#add-quantity", Input).value = ""
         self.query_one("#add-buy-price", Input).value = ""
         self.query_one("#add-ticker", Input).focus()
@@ -668,30 +776,54 @@ class PortfolioTextualApp(App):
         self.query_one("#clear-confirmation", Input).focus()
         self.set_status("Clear-all confirmation reset.")
 
+    def reset_view_all_editor(self) -> None:
+        self.selected_view_all_row_id = None
+        self._set_view_all_editor_visible(False)
+        self.query_one("#view-all-edit-exchange", Input).value = ""
+        self.query_one("#view-all-edit-quantity", Input).value = ""
+        self.query_one("#view-all-editor-summary", Static).update(
+            "No row selected. Use the ✎ row in the table to load the editor."
+        )
+        self.set_status("View-all editor cleared.")
+
+    def load_view_all_editor(self, row_id: int) -> None:
+        row = get_portfolio_row(row_id)
+        if not row:
+            self.set_status("The selected row no longer exists.")
+            return
+        self.selected_view_all_row_id = row_id
+        self._set_view_all_editor_visible(True)
+        self.query_one("#view-all-edit-exchange", Input).value = row["exchange"]
+        self.query_one("#view-all-edit-quantity", Input).value = row["quantity_text"]
+        self.query_one("#view-all-editor-summary", Static).update(
+            f"Editing row {row_id}: {row['ticker']} | Exchange={row['exchange']} | Qty={row['quantity_text']}"
+        )
+        self.query_one("#view-all-edit-exchange", Input).focus()
+        self.set_status(f"Loaded row {row_id} into the editor.")
+
     async def handle_add_coin(self) -> None:
         ticker = self.query_one("#add-ticker", Input).value.strip().upper()
+        exchange_name = self.query_one("#add-exchange", Input).value.strip() or "bitget"
         quantity_raw = self.query_one("#add-quantity", Input).value.strip()
         buy_price_raw = self.query_one("#add-buy-price", Input).value.strip()
-
         if not ticker:
             self.set_status("Coin ticker is required.")
             self.query_one("#add-ticker", Input).focus()
             return
-
         try:
             quantity = _parse_positive_number(quantity_raw, "Quantity")
             buy_price = _parse_positive_number(buy_price_raw, "Buy price")
         except ValueError as exc:
             self.set_status(str(exc))
             return
-
         self.set_status(f"Adding {ticker} to the portfolio...")
         try:
-            saved_ticker, current_price = await asyncio.to_thread(add_coin, ticker, quantity, buy_price)
+            saved_ticker, current_price = await asyncio.to_thread(
+                add_coin, ticker, quantity, buy_price, exchange_name
+            )
         except Exception as exc:
             self.set_status(f"Add failed: {exc}")
             return
-
         self.reset_add_form()
         self.set_status(
             f"{saved_ticker} added successfully. Latest fetched price: {_format_currency(current_price)}."
@@ -700,28 +832,23 @@ class PortfolioTextualApp(App):
     async def handle_remove_coin(self) -> None:
         ticker = self.query_one("#remove-ticker", Input).value.strip().upper()
         confirmation = self.query_one("#remove-confirmation", Input).value.strip().upper()
-
         if not ticker:
             self.set_status("Coin ticker is required before removing.")
             self.query_one("#remove-ticker", Input).focus()
             return
-
         if confirmation != "YES":
             self.set_status("Type YES in the confirmation field to remove the coin.")
             self.query_one("#remove-confirmation", Input).focus()
             return
-
         self.set_status(f"Removing {ticker} from the portfolio...")
         try:
             removed, count = await asyncio.to_thread(remove_coin, ticker)
         except Exception as exc:
             self.set_status(f"Remove failed: {exc}")
             return
-
         if not removed:
             self.set_status(f"{ticker} was not found in the database.")
             return
-
         self.reset_remove_form()
         self.set_status(f"Removed {count} row(s) for {ticker}.")
 
@@ -731,43 +858,66 @@ class PortfolioTextualApp(App):
             self.set_status("Enter a coin ticker to view.")
             self.query_one("#view-one-ticker", Input).focus()
             return
-
         self.set_status(f"Refreshing rows for {ticker}...")
         try:
-            rows, total = await asyncio.to_thread(get_portfolio_snapshot, ticker)
+            records, total = await asyncio.to_thread(get_portfolio_snapshot, ticker)
         except Exception as exc:
             self.set_status(f"View failed: {exc}")
             return
-
-        self._render_rows("#view-one-table", rows)
-        if not rows:
+        self._render_rows("#view-one-table", records)
+        if not records:
             self.query_one("#view-one-summary", Static).update(f"No data found for {ticker}.")
             self.set_status(f"No rows found for {ticker}.")
             return
-
         self.query_one("#view-one-summary", Static).update(
-            f"{len(rows)} row(s) for {ticker}. Total P/L: {_format_total(total)}"
+            f"{len(records)} row(s) for {ticker}. Total P/L: {_format_total(total)}"
         )
-        self.set_status(f"Loaded {len(rows)} row(s) for {ticker}.")
+        self.set_status(f"Loaded {len(records)} row(s) for {ticker}.")
 
     async def refresh_all_view(self) -> None:
         self.set_status("Refreshing full portfolio...")
         try:
-            rows, total = await asyncio.to_thread(get_portfolio_snapshot)
+            records, total = await asyncio.to_thread(get_portfolio_snapshot)
         except Exception as exc:
             self.set_status(f"Portfolio refresh failed: {exc}")
             return
-
-        self._render_rows("#view-all-table", rows)
-        if not rows:
+        self._render_rows("#view-all-table", records)
+        if not records:
             self.query_one("#view-all-summary", Static).update("No portfolio data found.")
+            self.reset_view_all_editor()
             self.set_status("Portfolio is empty.")
             return
-
         self.query_one("#view-all-summary", Static).update(
-            f"{len(rows)} row(s) loaded. Total P/L: {_format_total(total)}"
+            f"{len(records)} row(s) loaded. Total P/L: {_format_total(total)}"
         )
-        self.set_status(f"Portfolio refreshed with {len(rows)} row(s).")
+        self.set_status(f"Portfolio refreshed with {len(records)} row(s).")
+
+    async def handle_save_view_all_edit(self) -> None:
+        if self.selected_view_all_row_id is None:
+            self.set_status("Select a ✎ row in View all before saving changes.")
+            return
+        row_id = self.selected_view_all_row_id
+        exchange_name = self.query_one("#view-all-edit-exchange", Input).value.strip() or "bitget"
+        quantity_raw = self.query_one("#view-all-edit-quantity", Input).value.strip()
+        try:
+            quantity = _parse_positive_number(quantity_raw, "Buy quantity")
+        except ValueError as exc:
+            self.set_status(str(exc))
+            return
+        self.set_status(f"Saving changes for row {row_id}...")
+        try:
+            await asyncio.to_thread(
+                update_portfolio_row,
+                row_id,
+                quantity,
+                exchange_name,
+            )
+        except Exception as exc:
+            self.set_status(f"Update failed: {exc}")
+            return
+        await self.refresh_all_view()
+        self.reset_view_all_editor()
+        self.set_status(f"Updated row {row_id}.")
 
     async def handle_clear_all(self) -> None:
         confirmation = self.query_one("#clear-confirmation", Input).value.strip().upper()
@@ -775,14 +925,12 @@ class PortfolioTextualApp(App):
             self.set_status("Type CLEAR to remove every portfolio row.")
             self.query_one("#clear-confirmation", Input).focus()
             return
-
         self.set_status("Clearing all portfolio data...")
         try:
             deleted_rows = await asyncio.to_thread(clear_all_data)
         except Exception as exc:
             self.set_status(f"Clear-all failed: {exc}")
             return
-
         self.reset_clear_form()
         self._render_rows("#view-all-table", [])
         self._render_rows("#view-one-table", [])
@@ -791,28 +939,25 @@ class PortfolioTextualApp(App):
         self.query_one("#view-one-summary", Static).update("No coin loaded yet.")
         self.query_one("#live-summary", Static).update("No live portfolio data loaded yet.")
         self.query_one("#live-updated", Static).update("Last updated: never")
+        self.reset_view_all_editor()
         self.set_status(f"Removed {deleted_rows} row(s) from the database.")
 
     async def refresh_live_view(self) -> None:
         if self.live_refresh_in_progress:
             return
-
         self.live_refresh_in_progress = True
         self.set_status("Refreshing live portfolio data...")
-
         try:
-            rows, total = await asyncio.to_thread(get_portfolio_snapshot)
-            self._render_rows("#live-table", rows)
+            records, total = await asyncio.to_thread(get_portfolio_snapshot)
+            self._render_rows("#live-table", records)
             timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             self.query_one("#live-updated", Static).update(f"Last updated: {timestamp}")
-
-            if not rows:
+            if not records:
                 self.query_one("#live-summary", Static).update("No portfolio data found.")
                 self.set_status("Live view refreshed. Portfolio is empty.")
                 return
-
             self.query_one("#live-summary", Static).update(
-                f"{len(rows)} row(s) loaded. Total P/L: {_format_total(total)}"
+                f"{len(records)} row(s) loaded. Total P/L: {_format_total(total)}"
             )
             self.set_status(f"Live view refreshed at {timestamp}.")
         except Exception as exc:
@@ -826,12 +971,10 @@ def shutdown_async_runtime() -> None:
         asyncio.run_coroutine_threadsafe(async_exchange.close(), _loop).result(timeout=10)
     except Exception:
         pass
-
     try:
         _loop.call_soon_threadsafe(_loop.stop)
     except RuntimeError:
         pass
-
     _loop_thread.join(timeout=5)
 
 
