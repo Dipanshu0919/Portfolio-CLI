@@ -8,9 +8,11 @@ from functools import wraps
 
 import ccxt
 import ccxt.async_support as ccxt_async
+from rich.text import Text
 from tabulate import tabulate
+from textual import events
 from textual.app import App, ComposeResult
-from textual.containers import Container, Horizontal, Vertical
+from textual.containers import Container, Horizontal, HorizontalScroll, Vertical
 from textual.widgets import Button, DataTable, Footer, Header, Input, Static
 
 exchange = ccxt.bitget()
@@ -122,6 +124,14 @@ def _format_currency(value):
 
 def _format_total(value):
     return f"{float(value or 0):+.4f}"
+
+
+def _style_pnl_cell(value: str):
+    if value.startswith("+"):
+        return Text(value, style="bold green")
+    if value.startswith("-"):
+        return Text(value, style="bold red")
+    return Text(value, style="bold white")
 
 
 def _build_portfolio_snapshot(c, coin_name=None):
@@ -251,6 +261,8 @@ def _parse_positive_number(raw_value, field_name):
 
 
 class PortfolioTextualApp(App):
+    COMPACT_WIDTH = 100
+
     CSS = """
     Screen {
         layout: vertical;
@@ -262,12 +274,18 @@ class PortfolioTextualApp(App):
         dock: top;
     }
 
-    #nav-bar {
+    #nav-shell {
         dock: top;
         height: auto;
-        padding: 1 2;
         background: #0f172a;
         border-bottom: solid #1d4ed8;
+    }
+
+    #nav-bar {
+        height: auto;
+        width: auto;
+        padding: 1 2;
+        background: #0f172a;
     }
 
     #nav-bar Button {
@@ -354,6 +372,42 @@ class PortfolioTextualApp(App):
     Footer {
         dock: bottom;
     }
+
+    Screen.compact #nav-bar {
+        padding: 1;
+    }
+
+    Screen.compact #nav-bar Button {
+        min-width: 10;
+    }
+
+    Screen.compact #page-stack {
+        padding: 1;
+    }
+
+    Screen.compact .form-row {
+        layout: vertical;
+    }
+
+    Screen.compact .field-label {
+        width: 1fr;
+        padding-top: 0;
+        margin-bottom: 1;
+    }
+
+    Screen.compact .action-row {
+        layout: vertical;
+    }
+
+    Screen.compact .action-row Button {
+        width: 1fr;
+        margin-right: 0;
+        margin-bottom: 1;
+    }
+
+    Screen.compact .summary {
+        padding: 1;
+    }
     """
 
     BINDINGS = [
@@ -374,9 +428,10 @@ class PortfolioTextualApp(App):
 
     def compose(self) -> ComposeResult:
         yield Header()
-        with Horizontal(id="nav-bar"):
-            for page_name, label in NAV_ITEMS:
-                yield Button(label, id=f"nav-{page_name}")
+        with HorizontalScroll(id="nav-shell"):
+            with Horizontal(id="nav-bar"):
+                for page_name, label in NAV_ITEMS:
+                    yield Button(label, id=f"nav-{page_name}")
         with Container(id="page-stack"):
             with Vertical(id="page-add", classes="page"):
                 yield Static("Coins Add", classes="section-title")
@@ -468,8 +523,12 @@ class PortfolioTextualApp(App):
 
     def on_mount(self) -> None:
         self._setup_tables()
+        self._update_responsive_mode(self.size.width)
         self.switch_view("add")
         self.set_interval(5, self._trigger_live_refresh)
+
+    def on_resize(self, event: events.Resize) -> None:
+        self._update_responsive_mode(event.size.width)
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
         button_id = event.button.id or ""
@@ -564,11 +623,17 @@ class PortfolioTextualApp(App):
             table.add_columns(*PORTFOLIO_HEADERS)
             table.cursor_type = "row"
 
+    def _update_responsive_mode(self, width: int) -> None:
+        self.screen.set_class(width < self.COMPACT_WIDTH, "compact")
+
     def _render_rows(self, table_id: str, rows) -> None:
         table = self.query_one(table_id, DataTable)
         table.clear(columns=False)
         for row in rows:
-            table.add_row(*row)
+            styled_row = list(row)
+            if styled_row:
+                styled_row[-1] = _style_pnl_cell(str(styled_row[-1]))
+            table.add_row(*styled_row)
 
     def _trigger_live_refresh(self) -> None:
         if self.active_view != "live" or self.live_refresh_in_progress:
