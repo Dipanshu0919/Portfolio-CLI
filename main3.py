@@ -1,8 +1,8 @@
 from __future__ import annotations
 import asyncio
 import datetime
-import sqlite3 as sq
 import threading
+import sqlite3 as sq
 from functools import wraps
 import ccxt
 import ccxt.async_support as ccxt_async
@@ -13,8 +13,6 @@ from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, HorizontalScroll, Vertical
 from textual.widgets import Button, DataTable, Footer, Header, Input, Static
 exchange = ccxt.bitget()
-thread_lock = threading.Lock()
-price_dict: dict[str, float] = {}
 async_exchange = ccxt_async.bitget()
 _loop = asyncio.new_event_loop()
 _loop_thread = threading.Thread(target=_loop.run_forever, daemon=True)
@@ -48,8 +46,6 @@ def sqldb(function):
                 "TOTAL_AMOUNT decimal(38,18), "
                 "STATUS varchar(50))"
             )
-            # Removed ALTER TABLE migration code — EXCHANGE column is always
-            # present in the CREATE TABLE statement above.
             call_function = function(c, *args, **kwargs)
         finally:
             db.commit()
@@ -57,9 +53,6 @@ def sqldb(function):
         return call_function
     return wrapper
 
-
-def clear_price_dict():
-    price_dict.clear()
 
 
 async def async_single_fetch(coin, ticker="USDT"):
@@ -85,12 +78,8 @@ def run_async_fetch(coins_list, ticker="USDT"):
 def get_price(coin, ticker="USDT"):
     coin = coin.upper()
     ticker = ticker.upper()
-    if coin in price_dict:
-        return price_dict[coin]
     future = asyncio.run_coroutine_threadsafe(async_single_fetch(coin, ticker), _loop)
     _, price = future.result(timeout=10)
-    if price is not None:
-        price_dict[coin] = price
     return price
 
 
@@ -112,21 +101,6 @@ def _record_to_table_row(record):
     )
 
 
-@sqldb
-def update_price(c, row_id, coin, quantity, buy_price):
-    buy_total_amount = buy_price * quantity
-    current_price = get_price(coin)
-    if current_price is None:
-        return
-    current_total_amount = current_price * quantity
-    diff = current_total_amount - buy_total_amount
-    status = f"{diff:+.4f}"
-    with thread_lock:
-        c.execute(
-            "UPDATE pf SET STATUS=?, TOTAL_AMOUNT=?, CURRENT_PRICE=? WHERE rowid=?",
-            (status, round(current_total_amount, 18), current_price, row_id),
-        )
-
 
 def _format_currency(value):
     return f"${float(value or 0):.4f}"
@@ -146,56 +120,56 @@ def _style_pnl_cell(value: str):
 
 def _build_portfolio_snapshot(c, coin_name=None):
     query = "SELECT rowid AS ROW_ID, * FROM pf"
+    params: tuple = ()
     if coin_name:
         query += " WHERE TICKER=?"
-        c.execute(query, (coin_name,))
-    else:
-        c.execute(query)
+        params = (coin_name,)
+    c.execute(query, params)
     all_rows = c.fetchall()
     if not all_rows:
         return [], 0.0
-    coins_list = list({row["TICKER"] for row in all_rows})
-    fetched_prices = run_async_fetch(coins_list)
-    price_dict.update(fetched_prices)
-    threads = [
-        threading.Thread(
-            target=update_price,
-            args=(row["ROW_ID"], row["TICKER"], row["QUANTITY"], row["BUY_PRICE"]),
+
+    unique_tickers = list({row["TICKER"] for row in all_rows})
+    fetched_prices: dict[str, float] = run_async_fetch(unique_tickers)
+
+    for ticker, current_price in fetched_prices.items():
+        c.execute(
+            """
+            UPDATE pf
+            SET CURRENT_PRICE = ?,
+                TOTAL_AMOUNT   = ROUND(? * QUANTITY, 18),
+                STATUS         = printf('%+.4f', (? * QUANTITY) - BUY_TOTAL)
+            WHERE TICKER = ?
+            """,
+            (current_price, current_price, current_price, ticker),
         )
-        for row in all_rows
-    ]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-    clear_price_dict()
-    if coin_name:
-        c.execute(query, (coin_name,))
-    else:
-        c.execute(query)
+
+    c.execute(query, params)
     refreshed_rows = c.fetchall()
+
     rendered_rows = []
     total_profit_loss = 0.0
     for row in refreshed_rows:
-        buy_total = float(row["BUY_TOTAL"] or 0)
+        buy_total    = float(row["BUY_TOTAL"]    or 0)
         current_total = float(row["TOTAL_AMOUNT"] or 0)
-        status_value = float(row["STATUS"] or 0)
+        status_value  = float(row["STATUS"]       or 0)
         total_profit_loss += status_value
-        if buy_total == 0:
-            percentage = "N/A"
-        else:
-            percentage = f"{((current_total - buy_total) / buy_total) * 100:+.2f}%"
+        percentage = (
+            "N/A"
+            if buy_total == 0
+            else f"{((current_total - buy_total) / buy_total) * 100:+.2f}%"
+        )
         rendered_rows.append(
             {
-                "row_id": row["ROW_ID"],
-                "ticker": row["TICKER"],
-                "exchange": _normalize_exchange_value(row["EXCHANGE"]),
+                "row_id":        row["ROW_ID"],
+                "ticker":        row["TICKER"],
+                "exchange":      _normalize_exchange_value(row["EXCHANGE"]),
                 "quantity_text": str(row["QUANTITY"]),
-                "buy_price": row["BUY_PRICE"],
-                "buy_total": row["BUY_TOTAL"],
+                "buy_price":     row["BUY_PRICE"],
+                "buy_total":     row["BUY_TOTAL"],
                 "current_price": row["CURRENT_PRICE"],
-                "total_amount": row["TOTAL_AMOUNT"],
-                "pnl_text": f"{row['STATUS'] or '+0.0000'} ({percentage})",
+                "total_amount":  row["TOTAL_AMOUNT"],
+                "pnl_text":      f"{row['STATUS'] or '+0.0000'} ({percentage})",
             }
         )
     return rendered_rows, total_profit_loss
@@ -390,6 +364,27 @@ class PortfolioTextualApp(App):
     Footer {
         dock: bottom;
     }
+
+    /* ── Overlay editor: floats above the table, docked to bottom of page ── */
+    #view-all-editor {
+        layer: overlay;
+        dock: bottom;
+        height: auto;
+        background: #0d1b2e;
+        border: round #1d4ed8;
+        padding: 1 2;
+        margin: 0 1 1 1;
+    }
+    #view-all-editor #view-all-editor-summary {
+        margin: 0 0 1 0;
+        padding: 0 1;
+        background: #0f172a;
+        color: #bfdbfe;
+        border: round #334155;
+    }
+    #view-all-editor .action-row {
+        margin-top: 0;
+    }
     /* Edit row: two fields side-by-side */
     #view-all-edit-row {
         height: auto;
@@ -397,6 +392,7 @@ class PortfolioTextualApp(App):
     }
     #view-all-edit-row .field-label {
         width: 16;
+        padding-top: 1;
     }
     #view-all-edit-row .field-input {
         width: 1fr;
@@ -405,6 +401,7 @@ class PortfolioTextualApp(App):
     #view-all-edit-row .field-input:last-of-type {
         margin-right: 0;
     }
+
     Screen.compact #nav-bar {
         padding: 1;
     }
@@ -433,12 +430,38 @@ class PortfolioTextualApp(App):
     Screen.compact .summary {
         padding: 1;
     }
+
+    /* Compact overlay: collapse padding/margins to save height */
+    Screen.compact #view-all-editor {
+        padding: 0 1;
+        margin: 0 0 0 0;
+    }
+    Screen.compact #view-all-editor #view-all-editor-summary {
+        margin-bottom: 0;
+    }
     Screen.compact #view-all-edit-row {
         layout: vertical;
+        margin-bottom: 0;
+    }
+    Screen.compact #view-all-edit-row .field-label {
+        padding-top: 0;
+        margin-bottom: 0;
     }
     Screen.compact #view-all-edit-row .field-input {
         margin-right: 0;
         margin-bottom: 1;
+    }
+    Screen.compact #view-all-editor .action-row {
+        layout: horizontal;
+        margin-top: 0;
+    }
+    Screen.compact #view-all-editor .action-row Button {
+        width: 1fr;
+        margin-bottom: 0;
+        margin-right: 1;
+    }
+    Screen.compact #view-all-editor .action-row Button:last-of-type {
+        margin-right: 0;
     }
     """
     BINDINGS = [
@@ -468,7 +491,7 @@ class PortfolioTextualApp(App):
             # ── ADD ──────────────────────────────────────────────────────────
             with Vertical(id="page-add", classes="page"):
                 yield Static(
-                    "Coins Add  (Fill all fields, then submit to save a new holding to portfolio.db.)",
+                    "Coins Add (Fill all fields, then submit to save a new holding to portfolio.db.)",
                     classes="section-title",
                 )
                 with Horizontal(classes="form-row"):
@@ -476,7 +499,6 @@ class PortfolioTextualApp(App):
                     yield Input(placeholder="BTC", id="add-ticker", classes="field-input")
                 with Horizontal(classes="form-row"):
                     yield Static("Exchange", classes="field-label")
-                    # No default value — user types their exchange freely
                     yield Input(placeholder="bitget", id="add-exchange", classes="field-input")
                 with Horizontal(classes="form-row"):
                     yield Static("Total quantity", classes="field-label")
@@ -491,7 +513,7 @@ class PortfolioTextualApp(App):
             # ── REMOVE ───────────────────────────────────────────────────────
             with Vertical(id="page-remove", classes="page"):
                 yield Static(
-                    "Coin Remove  (Enter the ticker and type YES to remove every row for that coin.)",
+                    "Coin Remove (Enter the ticker and type YES to remove every row for that coin.)",
                     classes="section-title",
                 )
                 with Horizontal(classes="form-row"):
@@ -507,7 +529,7 @@ class PortfolioTextualApp(App):
             # ── VIEW ONE ─────────────────────────────────────────────────────
             with Vertical(id="page-view-one", classes="page"):
                 yield Static(
-                    "View Particular Coin  (Enter a ticker to refresh and display only that coin's rows.)",
+                    "View Particular Coin (Enter a ticker to refresh and display only that coin's rows.)",
                     classes="section-title",
                 )
                 with Horizontal(classes="form-row"):
@@ -522,21 +544,20 @@ class PortfolioTextualApp(App):
             # ── VIEW ALL ─────────────────────────────────────────────────────
             with Vertical(id="page-view-all", classes="page"):
                 yield Static(
-                    "View All Coins  (Refresh the whole portfolio with the latest fetched prices."
+                    "View All Coins (Refresh portfolio with latest prices."
                     " Press Enter on a ✎ row to edit Exchange and Qty.)",
                     classes="section-title",
                 )
                 with Horizontal(classes="action-row"):
                     yield Button("Refresh portfolio", id="submit-view-all", variant="primary")
                 yield Static("No portfolio data loaded yet.", id="view-all-summary", classes="summary")
-                # ── inline editor ────────────────────────────────────────────
+                yield DataTable(id="view-all-table")
+                # ── inline editor (overlay, rendered after table) ─────────────
                 with Vertical(id="view-all-editor"):
                     yield Static(
                         "No row selected. Use the ✎ row in the table to load the editor.",
                         id="view-all-editor-summary",
-                        classes="summary",
                     )
-                    # Exchange + Quantity on a single row
                     with Horizontal(id="view-all-edit-row"):
                         yield Static("Exchange", classes="field-label")
                         yield Input(
@@ -553,12 +574,11 @@ class PortfolioTextualApp(App):
                     with Horizontal(classes="action-row"):
                         yield Button("Save row changes", id="submit-view-all-edit", variant="primary")
                         yield Button("Cancel edit", id="reset-view-all-edit")
-                yield DataTable(id="view-all-table")
 
             # ── CLEAR ────────────────────────────────────────────────────────
             with Vertical(id="page-clear", classes="page"):
                 yield Static(
-                    "Clear All Data  (Type CLEAR to remove every portfolio row from the database.)",
+                    "Clear All Data (Type CLEAR to remove every portfolio row from the database.)",
                     classes="section-title",
                 )
                 with Horizontal(classes="form-row"):
@@ -571,7 +591,7 @@ class PortfolioTextualApp(App):
             # ── LIVE ─────────────────────────────────────────────────────────
             with Vertical(id="page-live", classes="page"):
                 yield Static(
-                    "Live Data  (This view auto-refreshes every 5 seconds while it is open.)",
+                    "Live Data (This view auto-refreshes every 5 seconds while it is open.)",
                     classes="section-title",
                 )
                 with Horizontal(classes="action-row"):
